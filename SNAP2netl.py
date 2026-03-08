@@ -4,47 +4,48 @@ import os
 import subprocess
 import tempfile
 import shutil
-import gc
 
-# =================配置區=================
-# 針對 128GB RAM 的頂級配置
-SORT_BUFFER_SIZE = "80G"   # 分配 80GB 給 Linux sort，盡量在記憶體內完成排序
-CPU_CORES = "12"           # 設定使用的 CPU 核心數 (請依據你的實際規格調整)
-# =======================================
+# =================配置區 (針對 128GB RAM 優化)=================
+# 分配 80GB 給外部排序緩衝區，確保絕大部分排序能在記憶體內完成
+SORT_BUFFER_SIZE = "80G"  
+# 假設你有充足的核心，這裡設定為 12 核心加速平行排序 (可依實際狀況調整)
+CPU_CORES = "12"           
 
-def external_sort(input_file, output_file, key_args, temp_dir):
-    """
-    呼叫 Linux sort，並強制使用大量 RAM 加速與指定的暫存目錄
-    """
-    print(f"  > [System Sort] Sorting {input_file}...")
-    print(f"    (Using {SORT_BUFFER_SIZE} RAM buffer and {CPU_CORES} threads)")
+# 暫存目錄設定
+# 注意：com-friendster 解壓與對稱化後檔案極大。
+# 加上 80GB 的排序緩衝，若全放 RAM Disk (/dev/shm) 會導致 128GB RAM OOM (Out Of Memory)。
+# 建議保持在當前目錄 (dir=".")，並確保該目錄位於高速 SSD 上。
+TEMP_DIR_BASE = "." 
+# =============================================================
 
-    # 加入 -T 參數，將 sort 的暫存目錄指向我們建立的 temp_dir，避免塞爆系統 /tmp
+def external_sort(input_file, output_file, key_args):
+    """呼叫 Linux sort 進行高速外部排序與去重"""
+    print(f"  > [System Sort] 啟動外部排序 (緩衝區: {SORT_BUFFER_SIZE}, 核心數: {CPU_CORES})...")
     cmd = (
-        f"sort -n {key_args} "
+        f"sort {key_args} "
         f"-S {SORT_BUFFER_SIZE} "
         f"--parallel={CPU_CORES} "
-        f"-T '{temp_dir}' "
         f"'{input_file}' -o '{output_file}'"
     )
-
     try:
         subprocess.check_call(cmd, shell=True)
     except subprocess.CalledProcessError as e:
         print(f"Sort command failed: {e}")
         sys.exit(1)
 
-def run_high_speed_conversion(input_gz, final_output):
-    # 使用當前目錄作為暫存，並確保有足夠的 SSD 空間 (建議至少預留 60GB)
-    temp_dir = tempfile.mkdtemp(dir=".")
-    print(f"Working directory for temp files: {temp_dir}")
+def run_row_net_conversion(input_gz, final_output):
+    temp_dir = tempfile.mkdtemp(dir=TEMP_DIR_BASE)
+    print(f"Working directory: {temp_dir}")
 
     try:
         # =========================================================
-        # 階段 1: 快速解壓 (Extract)
+        # 階段 1: 串流解壓並產生對稱邊 (Symmetrization)
         # =========================================================
-        step1_file = os.path.join(temp_dir, "step1_raw.txt")
-        print("Step 1: Extracting GZ (Streaming)...")
+        step1_file = os.path.join(temp_dir, "step1_sym.txt")
+        print("🚀 Step 1: 串流解壓縮並產生對稱邊 (Row-Net 模型前置作業)...")
+
+        max_node = 0
+        min_node = float('inf')
 
         with gzip.open(input_gz, 'rt', encoding='utf-8') as fin, \
              open(step1_file, 'w') as fout:
@@ -52,162 +53,142 @@ def run_high_speed_conversion(input_gz, final_output):
                 if line.startswith(('#', '%')): continue
                 parts = line.split()
                 if len(parts) < 2: continue
+
                 try:
-                    # 直接寫入 NetID NodeID (順序很重要，為了下一步排序)
-                    fout.write(f"{parts[1]} {parts[0]}\n")
-                except IndexError:
+                    u, v = int(parts[0]), int(parts[1])
+                except ValueError:
                     continue
-                # 每 500 萬行回報一次進度，避免洗畫面
+
+                # 追蹤圖的絕對大小
+                if u > max_node: max_node = u
+                if v > max_node: max_node = v
+                if u < min_node: min_node = u
+                if v < min_node: min_node = v
+
+                # 過濾原始的 Self-loops (對角線會在 Step 3 統一以結構化方式補回)
+                if u == v: continue
+
+                # 寫入雙向邊 (u->v 和 v->u)
+                fout.write(f"{u} {v}\n")
+                fout.write(f"{v} {u}\n")
+
                 if i % 5000000 == 0 and i > 0:
-                    print(f"  Extracted {i} lines...", end='\r')
-        print("\nExtraction done.")
+                    print(f"  已處理 {i:>12,} 行原始資料...", end='\r')
+        print(f"\n✅ Step 1 完成。")
+
+        # 計算偏移量：如果資料集是 0-based，我們將所有 ID +1 轉為 1-based (多數分割器要求)
+        offset = 1 if min_node == 0 else 0
+        total_nodes = max_node + offset
+        num_nets = total_nodes  # Row-Net Model 的核心: Nets 數量 = Nodes 數量
+
+        print(f"  📊 圖形統計: Min Node={min_node}, Max Node={max_node}, Total Size={total_nodes}")
 
         # =========================================================
-        # 階段 2: 高速排序 (Sort by NetID)
-        # 128GB RAM 發揮威力的時刻，80G 緩衝區會讓這一步快非常多
+        # 階段 2: 外部排序與 Edge-level 去重 (Sort Unique)
         # =========================================================
-        step2_sorted = os.path.join(temp_dir, "step2_sorted_by_net.txt")
-        # 依第一欄(Net)數字排序, 若相同則依第二欄(Node)排序。傳入 temp_dir
-        external_sort(step1_file, step2_sorted, "-k1,1 -k2,2", temp_dir)
-
-        # 刪除舊檔釋放磁碟空間
-        os.remove(step1_file)
+        step2_sorted = os.path.join(temp_dir, "step2_sorted_unique.txt")
+        print("🚀 Step 2: 外部排序與去重 (剔除重複的平行邊)...")
+        # -k1,1n -k2,2n 確保以數值方式精準遞增排序，-u 確保完全相同的邊會被剔除
+        external_sort(step1_file, step2_sorted, "-k1,1n -k2,2n -u")
+        os.remove(step1_file) # 釋放磁碟空間
 
         # =========================================================
-        # 階段 3: Python 過濾 (Filter)
-        # 移除平行邊、空邊、自環迴圈
+        # 階段 3: 生成 Row-Net 矩陣與補齊對角線/孤立點
         # =========================================================
-        print("Step 3: Filtering (Removing Parallel/Empty/Loops)...")
-        step3_file = os.path.join(temp_dir, "step3_valid_pairs.txt")
+        print("🚀 Step 3: 依據 Row-Net 模型生成超圖結構 (補齊對角線與孤立點)...")
+        body_file = os.path.join(temp_dir, "body.tmp")
 
-        seen_signatures = set()
-        current_net_id = None
+        final_pins_count = 0
+        current_net_id = -1
         current_nodes = []
-        new_net_counter = 0
 
-        with open(step2_sorted, 'r') as fin, open(step3_file, 'w') as fout:
-            for line in fin:
+        # Helper function: 寫入單一 Net (代表矩陣的某一個 Row)
+        def write_net(net_id, nodes, f_out):
+            nonlocal final_pins_count
+            # --- 關鍵：強制加入對角線 (Diagonal) ---
+            if net_id not in nodes:
+                nodes.append(net_id)
+                nodes.sort() # 保持 Node ID 遞增排序
+            
+            # 格式: 1 node1 1 node2 1 ... (對應 Format 11: NetWeight NodeID NodeWeight)
+            line_str = "1 " + " ".join(f"{n} 1" for n in nodes)
+            f_out.write(line_str + "\n")
+            final_pins_count += len(nodes)
+
+        with open(step2_sorted, 'r') as fin, open(body_file, 'w') as fbody:
+            expected_next_net = 1 # 用於偵測跳號的指標
+
+            for i, line in enumerate(fin):
                 parts = line.split()
-                net_val = parts[0]
-                node_val = parts[1]
+                # 加上 offset，轉為 1-based 系統
+                net_val = int(parts[0]) + offset
+                node_val = int(parts[1]) + offset
 
                 if net_val != current_net_id:
-                    # 處理上一組 Net
-                    if current_net_id is not None:
-                        # 去重節點 (list已有序)
-                        unique_nodes = []
-                        if current_nodes:
-                            unique_nodes.append(current_nodes[0])
-                            for x in current_nodes[1:]:
-                                if x != unique_nodes[-1]:
-                                    unique_nodes.append(x)
+                    if current_net_id != -1:
+                        write_net(current_net_id, current_nodes, fbody)
+                        expected_next_net = current_net_id + 1
 
-                        # 規則檢查
-                        if len(unique_nodes) >= 2:
-                            # 建立簽名 (Tuple of strings)
-                            sig = tuple(unique_nodes)
-                            if sig not in seen_signatures:
-                                seen_signatures.add(sig)
-                                new_net_counter += 1
-                                # 寫入: NodeID NewNetID (為下一步做準備)
-                                for n in unique_nodes:
-                                    fout.write(f"{n} {new_net_counter}\n")
+                    # --- 關鍵：填補 GAP (孤立點) ---
+                    # 如果有跳號，這些空缺的 Row 仍然存在，只包含對角線自己
+                    while expected_next_net < net_val:
+                        write_net(expected_next_net, [], fbody)
+                        expected_next_net += 1
 
-                    # 重置
                     current_net_id = net_val
                     current_nodes = [node_val]
                 else:
                     current_nodes.append(node_val)
+                    
+                if i % 10000000 == 0 and i > 0:
+                    print(f"  已寫入 {i:>12,} 條雙向邊...", end='\r')
 
-            # 處理最後一組
-            if current_net_id is not None and len(current_nodes) >= 2:
-                unique_nodes = sorted(list(set(current_nodes))) 
-                if len(unique_nodes) >= 2:
-                    sig = tuple(unique_nodes)
-                    if sig not in seen_signatures:
-                        new_net_counter += 1
-                        for n in unique_nodes:
-                            fout.write(f"{n} {new_net_counter}\n")
+            # 處理讀取結束後的最後一組
+            if current_net_id != -1:
+                write_net(current_net_id, current_nodes, fbody)
+                expected_next_net = current_net_id + 1
 
-        # 重要：主動釋放 Python 佔用的 RAM
-        del seen_signatures
-        gc.collect()
+            # 填補尾部直到最大 Node ID 的 GAP
+            while expected_next_net <= total_nodes:
+                write_net(expected_next_net, [], fbody)
+                expected_next_net += 1
+                
+        print(f"\n✅ Step 3 完成。")
         os.remove(step2_sorted)
-        print(f"  Valid Nets: {new_net_counter}")
 
         # =========================================================
-        # 階段 4: 再次高速排序 (Sort by NodeID)
-        # 為了輸出格式 Node -> [Net1, Net2...]
+        # 階段 4: 合併 Header 與 Body，完成輸出
         # =========================================================
-        step4_sorted = os.path.join(temp_dir, "step4_sorted_by_node.txt")
-        # 傳入 temp_dir 作為 sort 的安全暫存區
-        external_sort(step3_file, step4_sorted, "-k1,1 -k2,2", temp_dir)
-        os.remove(step3_file)
-
-        # =========================================================
-        # 階段 5: 寫入最終格式 (.net)
-        # =========================================================
-        print("Step 5: Writing Final Output...")
-
-        final_node_map = {}
-        next_node_id = 1
-        body_file = os.path.join(temp_dir, "body.tmp")
-        current_node_val = None
-        current_net_list = []
-
-        with open(step4_sorted, 'r') as fin, open(body_file, 'w') as fbody:
-            for line in fin:
-                parts = line.split()
-                node_val = parts[0]
-                net_val = parts[1]
-
-                if node_val != current_node_val:
-                    if current_node_val is not None:
-                        # 記錄這個 Node 有效，並給予連續編號
-                        final_node_map[current_node_val] = next_node_id
-                        next_node_id += 1
-
-                        fbody.write("1") # Node Weight
-                        for n_id in current_net_list:
-                            fbody.write(f" {n_id} 1") # NetID NetWeight
-                        fbody.write("\n")
-
-                    current_node_val = node_val
-                    current_net_list = [net_val]
-                else:
-                    current_net_list.append(net_val)
-
-            # 最後一行
-            if current_node_val is not None:
-                final_node_map[current_node_val] = next_node_id
-                fbody.write("1")
-                for n_id in current_net_list:
-                    fbody.write(f" {n_id} 1")
-                fbody.write("\n")
-
-        total_nodes = len(final_node_map)
-        del final_node_map
-        gc.collect()
-
-        print(f"Finalizing: {total_nodes} Nodes, {new_net_counter} Nets.")
+        print("🚀 Step 4: 組合最終 .netl 檔案...")
         with open(final_output, 'w') as f_final:
-            f_final.write(f"{total_nodes} {new_net_counter} 11\n")
+            # 寫入 Header
+            f_final.write(f"{total_nodes} {num_nets} 11\n")
+            # 寫入 Body
             with open(body_file, 'r') as f_body_in:
                 shutil.copyfileobj(f_body_in, f_final)
 
-        print(f"Completed! Output: {final_output}")
+        # 輸出統計報告
+        print("\n" + "="*40)
+        print("📊 Row-Net Model (Symmetrized) 最終統計報告")
+        print("="*40)
+        print(f"🔹 總節點數 (Nodes): {total_nodes:>15,}")
+        print(f"🔹 總超邊數 (Nets) : {num_nets:>15,} (絕對等於 Nodes 數)")
+        print(f"🔹 總 Pin 數 (Pins): {final_pins_count:>15,}")
+        print("="*40)
+        print(f"✅ 轉換大功告成！檔案已儲存至: {final_output}")
 
     finally:
-        # 確保程式無論成功或失敗，都會把佔用硬碟的暫存資料清乾淨
+        # 清理暫存目錄
         if os.path.exists(temp_dir):
+            print(f"🧹 清理暫存檔案目錄: {temp_dir}")
             shutil.rmtree(temp_dir)
 
 if __name__ == "__main__":
-    # 確保把 com-friendster.ungraph.txt.gz 放在和這支 Python 程式同一個資料夾下
+    # 輸入與輸出設定
     input_gz_file = "com-friendster.ungraph.txt.gz"
-    output_net_file = "comfriendster_hypergraph.netl"
+    output_net_file = "comfriendster_rownet.netl"
 
     if not os.path.exists(input_gz_file):
-        print(f"錯誤：找不到檔案 '{input_gz_file}'！請確認檔案路徑是否正確。")
+        print(f"❌ 錯誤: 找不到輸入檔案 '{input_gz_file}'。")
     else:
-        run_high_speed_conversion(input_gz_file, output_net_file)
+        run_row_net_conversion(input_gz_file, output_net_file)
