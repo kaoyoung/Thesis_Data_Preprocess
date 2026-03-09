@@ -62,16 +62,15 @@ def generate_and_save_two_stages():
         
         # 遍歷原始圖的每個節點
         for u in G.iterNodes():
-            # 取得鄰居，並將 ID 轉換為從 1 開始 (符合圖形分割軟體標準)
-            neighbors = [v + 1 for v in G.neighbors(u)]
+            # 取得鄰居 (使用 iterNeighbors)，並將 ID 轉換為從 1 開始
+            neighbors = [v + 1 for v in G.iterNeighbors(u)]
             net_id = u + 1
             
             # --- 關鍵：強制加入對角線 (Diagonal) ---
-            # 確保節點自己一定包含在這條超邊裡面
             if net_id not in neighbors:
                 neighbors.append(net_id)
             
-            # 排序 Node ID (確保數值嚴格遞增排序，格式美觀且符合嚴格規範)
+            # 排序 Node ID (確保數值嚴格遞增排序)
             neighbors.sort()
             
             # 格式化為 Format 11: 1 (Node Weight) nodeA 1 (Net Weight) nodeB 1 ...
@@ -89,8 +88,6 @@ def generate_and_save_two_stages():
     print(f"\n   ✅ 超圖轉換寫入完成！耗時: {time.time() - start_write_h:.2f} 秒")
     print(f"   📊 Row-Net 超圖統計: {total_nodes:,} Nodes, {total_nets:,} Nets, {final_pins_count:,} Pins")
     print(f"   📂 檔案位置: {os.path.abspath(HYPERGRAPH_FILE)}\n")
-    
-    print(f"🎉 任務圓滿結束！總執行時間: {time.time() - start_time:.2f} 秒")
 
 if __name__ == "__main__":
     # 確保系統安裝了 networkit: pip install networkit
